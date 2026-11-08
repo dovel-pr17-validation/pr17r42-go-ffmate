@@ -1,0 +1,161 @@
+package internal
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"time"
+
+	"github.com/welovemedia/ffmate/v2/internal/cfg"
+	"github.com/welovemedia/ffmate/v2/internal/controller"
+	"github.com/welovemedia/ffmate/v2/internal/database/repository"
+	"github.com/welovemedia/ffmate/v2/internal/debug"
+	"github.com/welovemedia/ffmate/v2/internal/middleware"
+	"github.com/welovemedia/ffmate/v2/internal/service"
+	"github.com/welovemedia/ffmate/v2/internal/service/client"
+	"github.com/welovemedia/ffmate/v2/internal/service/ffmpeg"
+	"github.com/welovemedia/ffmate/v2/internal/service/preset"
+	"github.com/welovemedia/ffmate/v2/internal/service/settings"
+	"github.com/welovemedia/ffmate/v2/internal/service/task"
+	"github.com/welovemedia/ffmate/v2/internal/service/telemetry"
+	"github.com/welovemedia/ffmate/v2/internal/service/update"
+	"github.com/welovemedia/ffmate/v2/internal/service/watchfolder"
+	"github.com/welovemedia/ffmate/v2/internal/service/webhook"
+	"github.com/welovemedia/ffmate/v2/internal/service/websocket"
+	"goyave.dev/goyave/v5"
+	"goyave.dev/goyave/v5/cors"
+	"goyave.dev/goyave/v5/middleware/parse"
+)
+
+func Init(options goyave.Options) {
+	// create a new Goyave instance
+	options.Logger = nil
+	server, err := goyave.New(options)
+	if err != nil {
+		debug.Log.Error("failed to initiaize goyave: %v", err)
+		os.Exit(1)
+	}
+
+	// give db info for slow database connections
+	debug.Log.Info(fmt.Sprintf("%s version %s", server.Config().GetString("app.name"), server.Config().GetString("app.version")))
+	debug.Log.Info("connecting to database")
+
+	// setup cors
+	server.Router().CORS(&cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE"},
+		AllowedHeaders:   []string{"*"},
+		ExposedHeaders:   []string{"*"},
+		AllowCredentials: true,
+	})
+
+	// add global parse middleware
+	server.Router().GlobalMiddleware(&parse.Middleware{
+		MaxUploadSize: 10,
+	})
+
+	// register startup hooks
+	var startTime time.Time
+	server.RegisterSignalHook()
+	server.RegisterStartupHook(func(*goyave.Server) {
+		debug.Log.Info("server started on port '%d' using driver '%s'", server.Config().GetInt("server.port"), server.Config().GetString("database.connection"))
+		startTime = time.Now()
+
+		// open the UI in the browser
+		if cfg.GetBool("ffmate.isUI") && !cfg.GetBool("ffmate.isDocker") {
+			url := fmt.Sprintf("http://localhost:%d/ui", server.Config().GetInt("server.port"))
+			switch runtime.GOOS {
+			case "linux":
+				_ = exec.Command("xdg-open", url).Start()
+			case "darwin":
+				_ = exec.Command("open", url).Start()
+			case "windows":
+				_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+			}
+		}
+	})
+
+	// setup repositories
+	presetRepository := (&repository.Preset{DB: server.DB()}).Setup()
+	webhookRepository := (&repository.Webhook{DB: server.DB()}).Setup()
+	webhookExecutionRepository := (&repository.WebhookExecution{DB: server.DB()}).Setup()
+	watchfolderRepository := (&repository.Watchfolder{DB: server.DB()}).Setup()
+	taskRepository := (&repository.Task{DB: server.DB()}).Setup()
+	settingRepository := (&repository.Settings{DB: server.DB()}).Setup()
+	clientRepository := (&repository.Client{DB: server.DB()}).Setup()
+
+	// setup and register services
+	telemetrySvc := telemetry.NewService(server.Config(), server.DB())
+	ffmpegSvc := ffmpeg.NewService()
+	updateSvc := update.NewService(server.Config().GetString("app.version"))
+	websocketSvc := websocket.NewService(server.DB())
+	clientSvc := client.NewService(clientRepository, server.Config().GetString("app.version"), websocketSvc)
+	webhookSvc := webhook.NewService(webhookRepository, webhookExecutionRepository, server.Config(), websocketSvc)
+	presetSvc := preset.NewService(presetRepository, webhookSvc, websocketSvc)
+	taskSvc := task.NewService(taskRepository, presetSvc, webhookSvc, websocketSvc, ffmpegSvc, true)
+	watchfolderSvc := watchfolder.NewService(watchfolderRepository, webhookSvc, websocketSvc, taskSvc)
+	settingSvc := settings.NewService(settingRepository)
+	for name, svc := range map[string]goyave.Service{
+		service.Update:      updateSvc,
+		service.FFMpeg:      ffmpegSvc,
+		service.Telemetry:   telemetrySvc,
+		service.Websocket:   websocketSvc,
+		service.Webhook:     webhookSvc,
+		service.Preset:      presetSvc,
+		service.Watchfolder: watchfolderSvc,
+		service.Task:        taskSvc,
+		service.Settings:    settingSvc,
+		service.Client:      clientSvc,
+	} {
+		server.RegisterService(svc)
+		debug.Service.Debug("registered %s service", name)
+	}
+
+	// register routes
+	server.RegisterRoutes(func(server *goyave.Server, router *goyave.Router) {
+		controller.Register(server, router)
+		middleware.Register(server, router)
+	})
+
+	// setup debug logger to broadcast to websocket clients
+	debug.RegisterBroadcastLogger(func(p []byte) {
+		re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+		websocketSvc.Broadcast(websocket.Log, re.ReplaceAllString(string(p), ""))
+	})
+
+	// init cluster if enabled
+	if cfg.GetBool("ffmate.isCluster") {
+		go websocketSvc.InitCluster()
+	}
+
+	// setup telemetry (if enabled)
+	if cfg.GetBool("ffmate.telemetry.send") {
+		// send telemetry data on shutdown
+		server.RegisterShutdownHook(func(*goyave.Server) {
+			telemetrySvc.SendTelemetry(startTime, true, false)
+		})
+
+		// send telemetry on startup and every 3 hours
+		server.RegisterStartupHook(func(*goyave.Server) {
+			var startup = true
+			go func() {
+				const interval = 3 * time.Hour
+				for {
+					telemetrySvc.SendTelemetry(startTime, false, startup)
+					startup = false
+					time.Sleep(interval)
+				}
+			}()
+		})
+	}
+
+	// start watchfolder processor
+	watchfolderSvc.Process()
+
+	if err := server.Start(); err != nil {
+		debug.Log.Error("failed to start ffmate server: %v", err)
+		os.Exit(1)
+	}
+}

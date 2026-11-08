@@ -1,0 +1,14 @@
+.DS_STORE
+tmp/
+_update
+_bin/
+dist/
+node_modules/
+.vscode/
+todo.txt
+_app
+.vscode
+**/ui-build/*
+!**/ui-build/index.html
+coverage.txt
+edith.yaml
