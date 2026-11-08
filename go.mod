@@ -82,7 +82,7 @@ require (
 	github.com/andybalholm/brotli v1.2.7
 	github.com/glebarez/sqlite v1.11.0
 	github.com/lib/pq v1.10.9
-	github.com/mattn/go-shellwords v1.0.12
+	github.com/mattn/go-shellwords v1.0.16
 	github.com/stretchr/testify v1.12.1
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/swaggo/swag v1.16.6
