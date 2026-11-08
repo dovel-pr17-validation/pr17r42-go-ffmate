@@ -79,7 +79,7 @@ require (
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.7
+	github.com/andybalholm/brotli v1.2.8
 	github.com/glebarez/sqlite v1.11.0
 	github.com/lib/pq v1.10.9
 	github.com/mattn/go-shellwords v1.0.12
